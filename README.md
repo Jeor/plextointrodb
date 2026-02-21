@@ -1,6 +1,6 @@
 # Plex Intro/Credits to IntroDB Uploader
 
-Small Python GUI tool for exporting Plex skip-intro / credits markers from a Plex SQLite DB and submitting them to IntroDB.
+Small Python GUI tool for exporting skip-intro / credits markers from a Plex SQLite DB and submitting them to IntroDB.
 
 ## Features
 
@@ -9,8 +9,7 @@ Small Python GUI tool for exporting Plex skip-intro / credits markers from a Ple
   - Dry run (no network calls).
   - Limit submissions (default 10).
   - Include intro and/or credits markers.
-  - Auto-try fallback API endpoints if the first endpoint returns 404.
-- Defaults to IntroDB endpoint `/api/submissions`.
+- Configurable IntroDB API base URL + endpoint path.
 - Bearer token authentication.
 
 ## Run
@@ -27,6 +26,6 @@ python plex_introdb_uploader.py
 
 ## Notes
 
-- The query now pulls only marker tags of `intro` and `credits`, instead of scanning all taggings.
-- Run in **dry run** first to verify payload fields and marker counts.
-- If your IntroDB deployment uses a different route, change the endpoint field in the GUI.
+- The script detects marker rows by looking for `intro`/`credit` text in marker/tag fields.
+- Because Plex database schemas can vary by version, run in **dry run** first to confirm payloads.
+- API payload format may evolve; if IntroDB requires additional fields, update `Marker.to_payload()`.

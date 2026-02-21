@@ -15,8 +15,7 @@ from tkinter.scrolledtext import ScrolledText
 
 CONFIG_PATH = Path.home() / ".plex_introdb_uploader.json"
 DEFAULT_API_BASE = "https://api.introdb.app"
-DEFAULT_ENDPOINT = "/api/submissions"
-FALLBACK_ENDPOINTS = ["/api/submissions", "/submissions", "/v1/submissions"]
+DEFAULT_ENDPOINT = "/submissions"
 
 
 @dataclass
@@ -29,17 +28,15 @@ class Marker:
     title: str | None
 
     def to_payload(self) -> dict:
-        payload = {
+        return {
             "source": "plex",
             "marker_type": self.marker_type,
             "start_ms": self.start_ms,
             "end_ms": self.end_ms,
+            "metadata_item_id": self.metadata_item_id,
             "guid": self.guid,
             "title": self.title,
         }
-        if self.metadata_item_id is not None:
-            payload["metadata_item_id"] = self.metadata_item_id
-        return payload
 
 
 class IntroDBUploaderApp:
@@ -58,7 +55,6 @@ class IntroDBUploaderApp:
         self.limit = IntVar(value=10)
         self.include_intro = BooleanVar(value=True)
         self.include_credits = BooleanVar(value=True)
-        self.auto_retry_endpoints = BooleanVar(value=True)
 
         self._load_config()
         self._build_ui()
@@ -94,7 +90,6 @@ class IntroDBUploaderApp:
 
         ttk.Checkbutton(opts, text="Include intro markers", variable=self.include_intro).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Checkbutton(opts, text="Include credits markers", variable=self.include_credits).grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(20, 0))
-        ttk.Checkbutton(opts, text="Auto-try fallback endpoints on 404", variable=self.auto_retry_endpoints).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         row += 1
         actions = ttk.Frame(frame)
@@ -145,7 +140,7 @@ class IntroDBUploaderApp:
     def _run_submission(self) -> None:
         try:
             markers = extract_markers(Path(self.db_path.get()))
-            self.root.after(0, lambda: self._log(f"Found {len(markers)} intro/credits markers in Plex DB."))
+            self.root.after(0, lambda: self._log(f"Found {len(markers)} candidate markers."))
 
             filtered = [
                 m
@@ -160,23 +155,21 @@ class IntroDBUploaderApp:
 
             sent = 0
             failed = 0
-            endpoint = self.endpoint.get().strip()
             for idx, marker in enumerate(filtered, start=1):
                 payload = marker.to_payload()
                 if self.dry_run.get():
                     self.root.after(0, lambda p=payload: self._log("DRY RUN: " + json.dumps(p, ensure_ascii=False)))
                     sent += 1
                 else:
-                    ok, response, used_endpoint = post_submission_with_fallback(
+                    ok, response = post_submission(
                         base_url=self.api_base.get().strip(),
-                        endpoint=endpoint,
+                        endpoint=self.endpoint.get().strip(),
                         token=self.api_key.get().strip(),
                         payload=payload,
-                        use_fallbacks=self.auto_retry_endpoints.get(),
                     )
                     if ok:
                         sent += 1
-                        self.root.after(0, lambda i=idx, e=used_endpoint, r=response: self._log(f"[{i}] Submitted OK via {e}: {r}"))
+                        self.root.after(0, lambda i=idx, r=response: self._log(f"[{i}] Submitted OK: {r}"))
                     else:
                         failed += 1
                         self.root.after(0, lambda i=idx, r=response: self._log(f"[{i}] Submit failed: {r}"))
@@ -200,17 +193,13 @@ class IntroDBUploaderApp:
 
         self.db_path.set(data.get("db_path", ""))
         self.api_base.set(data.get("api_base", DEFAULT_API_BASE))
-        loaded_endpoint = data.get("endpoint", DEFAULT_ENDPOINT)
-        if loaded_endpoint == "/submissions":
-            loaded_endpoint = DEFAULT_ENDPOINT
-        self.endpoint.set(loaded_endpoint)
+        self.endpoint.set(data.get("endpoint", DEFAULT_ENDPOINT))
         self.api_key.set(data.get("api_key", ""))
         self.dry_run.set(bool(data.get("dry_run", True)))
         self.use_limit.set(bool(data.get("use_limit", True)))
         self.limit.set(int(data.get("limit", 10)))
         self.include_intro.set(bool(data.get("include_intro", True)))
         self.include_credits.set(bool(data.get("include_credits", True)))
-        self.auto_retry_endpoints.set(bool(data.get("auto_retry_endpoints", True)))
 
     def _save_config(self) -> None:
         data = {
@@ -223,7 +212,6 @@ class IntroDBUploaderApp:
             "limit": self.limit.get(),
             "include_intro": self.include_intro.get(),
             "include_credits": self.include_credits.get(),
-            "auto_retry_endpoints": self.auto_retry_endpoints.get(),
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -237,18 +225,10 @@ def extract_markers(db_path: Path) -> list[Marker]:
     try:
         rows = con.execute(
             """
-            SELECT
-              tg.metadata_item_id,
-              tg.time_offset,
-              tg.end_time_offset,
-              LOWER(t.tag) AS marker_tag,
-              mi.guid AS media_guid,
-              mi.title AS media_title
+            SELECT tg.*, t.tag AS tag_name, mi.guid AS media_guid, mi.title AS media_title
             FROM taggings tg
-            JOIN tags t ON t.id = tg.tag_id
+            LEFT JOIN tags t ON t.id = tg.tag_id
             LEFT JOIN metadata_items mi ON mi.id = tg.metadata_item_id
-            WHERE LOWER(t.tag) IN ('intro', 'credits')
-            ORDER BY tg.metadata_item_id, tg.time_offset
             """
         ).fetchall()
     finally:
@@ -256,61 +236,61 @@ def extract_markers(db_path: Path) -> list[Marker]:
 
     markers: list[Marker] = []
     for row in rows:
-        marker_type = row["marker_tag"]
-        if marker_type not in {"intro", "credits"}:
+        marker_type = infer_marker_type(row)
+        if not marker_type:
             continue
-
+        start_ms, end_ms = infer_offsets(row)
         markers.append(
             Marker(
                 marker_type=marker_type,
-                start_ms=first_int_value(row["time_offset"]),
-                end_ms=first_int_value(row["end_time_offset"]),
-                metadata_item_id=first_int_value(row["metadata_item_id"]),
-                guid=row["media_guid"],
-                title=row["media_title"],
+                start_ms=start_ms,
+                end_ms=end_ms,
+                metadata_item_id=row["metadata_item_id"] if "metadata_item_id" in row.keys() else None,
+                guid=row["media_guid"] if "media_guid" in row.keys() else None,
+                title=row["media_title"] if "media_title" in row.keys() else None,
             )
         )
     return markers
 
 
-def first_int_value(value: object) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
+def infer_marker_type(row: sqlite3.Row) -> str | None:
+    candidates = []
+    for key in row.keys():
+        value = row[key]
+        if isinstance(value, str):
+            candidates.append(value.lower())
+
+    haystack = " | ".join(candidates)
+    if "intro" in haystack:
+        return "intro"
+    if "credit" in haystack:
+        return "credits"
     return None
 
 
-def post_submission_with_fallback(
-    base_url: str,
-    endpoint: str,
-    token: str,
-    payload: dict,
-    use_fallbacks: bool,
-) -> tuple[bool, str, str]:
-    endpoints = [endpoint]
-    if use_fallbacks:
-        endpoints.extend(e for e in FALLBACK_ENDPOINTS if e != endpoint)
+def infer_offsets(row: sqlite3.Row) -> tuple[int | None, int | None]:
+    start_candidates = ["time_offset", "start_time_offset", "start_time_ms", "start_ms", "start_time"]
+    end_candidates = ["end_time_offset", "end_time_ms", "end_ms", "end_time"]
 
-    first_error = "Unknown error"
-    for candidate in endpoints:
-        ok, response = post_submission(base_url=base_url, endpoint=candidate, token=token, payload=payload)
-        if ok:
-            return True, response, candidate
-        if first_error == "Unknown error":
-            first_error = response
-        if "HTTP 404" not in response:
-            return False, response, candidate
+    start = first_int_field(row, start_candidates)
+    end = first_int_field(row, end_candidates)
+    return start, end
 
-    return False, first_error, endpoint
+
+def first_int_field(row: sqlite3.Row, names: list[str]) -> int | None:
+    for name in names:
+        if name not in row.keys():
+            continue
+        value = row[name]
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
 
 
 def post_submission(base_url: str, endpoint: str, token: str, payload: dict) -> tuple[bool, str]:
-    if endpoint.startswith("http://") or endpoint.startswith("https://"):
-        url = endpoint
-    else:
-        url = base_url.rstrip("/") + "/" + endpoint.lstrip("/")
-
+    url = base_url.rstrip("/") + "/" + endpoint.lstrip("/")
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url=url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
